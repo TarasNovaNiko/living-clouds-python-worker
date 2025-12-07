@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Віртуальне середовище
+venv/
+.venv/
+
+# IDE / редактори
+.idea/
+.vscode/
+
+# Інше сміття
+*.log

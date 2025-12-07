@@ -1,0 +1,12 @@
+RunPod worker (план):
+
+- Використати Dockerfile з папки living-clouds-python.
+- Зібрати образ (локально або через RunPod) з командою:
+    docker build -t living-clouds-backend .
+- Усередині контейнера змінна USE_SD=1 => вмикається справжній Stable Diffusion.
+- Контейнер слухає порт 8000: uvicorn app:app --host 0.0.0.0 --port 8000
+- Netlify-функція generate замість http://127.0.0.1:8000/txt2img
+  повинна буде ходити на URL RunPod (типу https://your-endpoint.runpod.io/txt2img).
+- Формат запиту/відповіді НЕ міняти:
+    запит: { "prompt": "...", ... }
+    відповідь: { ok, mode, prompt, image_base64, ... }
