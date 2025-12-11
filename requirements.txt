@@ -8,3 +8,4 @@ transformers
 safetensors
 accelerate
 Pillow
+runpod
