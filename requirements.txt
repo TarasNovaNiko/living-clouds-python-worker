@@ -1,11 +1,8 @@
-fastapi
-uvicorn[standard]
+runpod
 pydantic
+Pillow
 
-torch
 diffusers
 transformers
 safetensors
 accelerate
-Pillow
-runpod

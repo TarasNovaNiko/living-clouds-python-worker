@@ -1,26 +1,30 @@
-# living-clouds-python/Dockerfile
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
-# Базовий образ з Python
-FROM python:3.11-slim
-
-# Щоб Python не буферизував лог і одразу писав у stdout
-ENV PYTHONUNBUFFERED=1
-
-# Вмикаємо використання Stable Diffusion всередині контейнера
-# (локально ми залишимо USE_SD=0, а в контейнері буде USE_SD=1)
-ENV USE_SD=1
-
-# Створюємо робочу директорію всередині контейнера
+ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
 
-# Копіюємо файли проєкту (тільки бекенд) у контейнер
-COPY . /app
+# Python + basic deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv git \
+    && rm -rf /var/lib/apt/lists/*
 
-# Встановлюємо залежності
+RUN python3 -m pip install --upgrade pip
+
+# Install CUDA-enabled PyTorch first (important)
+RUN pip install --no-cache-dir \
+    torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# Install the rest
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Відкриваємо порт 8000 всередині контейнера
-EXPOSE 8000
+# Copy worker
+COPY worker.py .
+COPY model_stub.py .
 
-# Команда запуску FastAPI через uvicorn
-CMD ["python", "-u", "worker.py"]
+# Optional: cache folders (helps speed on cold starts if volume supported)
+ENV HF_HOME=/tmp/hf
+ENV TRANSFORMERS_CACHE=/tmp/hf
+ENV TORCH_HOME=/tmp/torch
+
+CMD ["python3", "worker.py"]
