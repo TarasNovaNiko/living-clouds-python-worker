@@ -1,11 +1,12 @@
 import base64
+import binascii
 import io
 import os
 from typing import Any, Dict, Optional
 
 import runpod
 import torch
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 from diffusers import StableDiffusionPipeline, StableDiffusionImg2ImgPipeline
 
@@ -45,20 +46,69 @@ def _load_pipes():
         _img2img_pipe.enable_attention_slicing()
 
 
-def _b64_to_pil(image_base64: str) -> Image.Image:
-    # приймаємо і чистий base64, і data URL
-    if "," in image_base64 and image_base64.strip().lower().startswith("data:"):
-        image_base64 = image_base64.split(",", 1)[1]
+def _normalize_base64(s: str) -> str:
+    """
+    - приймає або "data:image/...;base64,AAA...", або чистий base64
+    - прибирає пробіли/переноси
+    - додає padding '=' якщо потрібно
+    """
+    if not isinstance(s, str) or not s.strip():
+        raise ValueError("init_image_base64 is empty or not a string")
 
-    data = base64.b64decode(image_base64)
-    img = Image.open(io.BytesIO(data)).convert("RGB")
-    return img
+    s = s.strip()
+
+    # data URL -> залишаємо лише частину після коми
+    if s.lower().startswith("data:") and "," in s:
+        s = s.split(",", 1)[1]
+
+    # прибираємо всі пробіли/переноси (часто з'являються при копіюванні)
+    s = "".join(s.split())
+
+    # padding
+    pad = len(s) % 4
+    if pad:
+        s += "=" * (4 - pad)
+
+    return s
+
+
+def _b64_to_pil(image_base64: str) -> Image.Image:
+    b64 = _normalize_base64(image_base64)
+
+    try:
+        data = base64.b64decode(b64, validate=False)
+    except (binascii.Error, ValueError) as e:
+        raise ValueError(
+            "init_image_base64 is not valid base64. "
+            "Make sure you paste the full string (not truncated)."
+        ) from e
+
+    try:
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+        return img
+    except UnidentifiedImageError as e:
+        # Це саме твій кейс: base64 декодується, але байти не є PNG/JPG (часто обрізано).
+        raise ValueError(
+            "Decoded init_image_base64 is not a valid image (PNG/JPG). "
+            "Most common cause: the base64 string is truncated when copying/pasting. "
+            "Try copying from the JSON using the copy icon, and ensure the string is complete."
+        ) from e
 
 
 def _pil_to_b64_png(img: Image.Image) -> str:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def _resize_to_multiple_of_8(img: Image.Image) -> Image.Image:
+    # SD1.5 працює стабільніше на розмірах кратних 8
+    w, h = img.size
+    w2 = max(8, (w // 8) * 8)
+    h2 = max(8, (h // 8) * 8)
+    if (w2, h2) != (w, h):
+        img = img.resize((w2, h2))
+    return img
 
 
 def handler(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -73,10 +123,7 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         guidance = float(input_data.get("guidance", DEFAULT_GUIDANCE))
         seed = input_data.get("seed", None)
 
-        if seed is not None:
-            generator = torch.Generator(device=_device).manual_seed(int(seed))
-        else:
-            generator = None
+        generator = torch.Generator(device=_device).manual_seed(int(seed)) if seed is not None else None
 
         _load_pipes()
 
@@ -106,10 +153,16 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         if mode == "img2img":
             init_b64 = input_data.get("init_image_base64")
             if not init_b64:
-                return {"ok": False, "stage": "validation_error", "error": "init_image_base64 is required for img2img"}
+                return {
+                    "ok": False,
+                    "stage": "validation_error",
+                    "error": "init_image_base64 is required for img2img",
+                }
 
             strength = float(input_data.get("strength", DEFAULT_STRENGTH))
+
             init_img = _b64_to_pil(init_b64)
+            init_img = _resize_to_multiple_of_8(init_img)
 
             out = _img2img_pipe(
                 prompt=prompt,
@@ -133,6 +186,7 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
                     "guidance": guidance,
                     "seed": seed,
                     "model": MODEL_ID,
+                    "init_size": list(init_img.size),
                 },
             }
 
