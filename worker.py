@@ -1,34 +1,32 @@
 import os
 import base64
 from io import BytesIO
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
+
+import requests
+from PIL import Image
 
 import runpod
-import requests
-from PIL import Image, UnidentifiedImageError
 
-# ----------------------------
-# Cache dirs: avoid filling root disk
-# ----------------------------
+# IMPORTANT: force HF caches into /tmp (helps prevent "No space left on device")
 os.environ.setdefault("HF_HOME", "/tmp/hf")
-os.environ.setdefault("HUGGINGFACE_HUB_CACHE", "/tmp/hf/hub")
+os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
 os.environ.setdefault("TRANSFORMERS_CACHE", "/tmp/hf/transformers")
 os.environ.setdefault("DIFFUSERS_CACHE", "/tmp/hf/diffusers")
-os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
-# ----------------------------
-# Model (SD 1.5) – lazy-loaded
-# ----------------------------
-PIPE_TXT2IMG = None
-PIPE_IMG2IMG = None
+MODEL_ID = os.getenv("SD_MODEL_ID", "runwayml/stable-diffusion-v1-5")
+
+# Optional HF token (if the model is gated on HF for your account)
+HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+
+# Lazy-loaded pipelines
+_txt2img_pipe = None
+_img2img_pipe = None
 
 
-def _load_pipelines() -> Tuple[Any, Any]:
-    global PIPE_TXT2IMG, PIPE_IMG2IMG
-
-    if PIPE_TXT2IMG is not None and PIPE_IMG2IMG is not None:
-        return PIPE_TXT2IMG, PIPE_IMG2IMG
+def _get_pipes():
+    global _txt2img_pipe, _img2img_pipe
 
     import torch
     from diffusers import StableDiffusionPipeline, StableDiffusionImg2ImgPipeline
@@ -36,210 +34,146 @@ def _load_pipelines() -> Tuple[Any, Any]:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available. Deploy endpoint as GPU worker.")
 
-    model_id = os.getenv("SD_MODEL_ID", "runwayml/stable-diffusion-v1-5")
-    hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
-
-    dtype = torch.float16
-    PIPE_TXT2IMG = StableDiffusionPipeline.from_pretrained(
-        model_id,
-        torch_dtype=dtype,
-        safety_checker=None,
-        use_auth_token=hf_token,
-    ).to("cuda")
-
-    PIPE_IMG2IMG = StableDiffusionImg2ImgPipeline.from_pretrained(
-        model_id,
-        torch_dtype=dtype,
-        safety_checker=None,
-        use_auth_token=hf_token,
-    ).to("cuda")
-
-    try:
-        PIPE_TXT2IMG.enable_attention_slicing()
-        PIPE_IMG2IMG.enable_attention_slicing()
-    except Exception:
-        pass
-
-    return PIPE_TXT2IMG, PIPE_IMG2IMG
-
-
-# ----------------------------
-# Image helpers
-# ----------------------------
-MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(15 * 1024 * 1024)))  # 15 MB
-
-
-def _strip_data_url_prefix(b64: str) -> str:
-    if "," in b64 and b64.strip().lower().startswith("data:"):
-        return b64.split(",", 1)[1]
-    return b64
-
-
-def _image_from_base64(b64: str) -> Image.Image:
-    b64 = _strip_data_url_prefix(b64).strip()
-    raw = base64.b64decode(b64, validate=True)
-
-    if len(raw) > MAX_IMAGE_BYTES:
-        raise ValueError(f"Decoded image is too large ({len(raw)} bytes). Limit is {MAX_IMAGE_BYTES} bytes.")
-
-    try:
-        img = Image.open(BytesIO(raw))
-        img.load()
-        return img.convert("RGB")
-    except UnidentifiedImageError:
-        raise ValueError(
-            "Decoded init_image_base64 is not a valid image (PNG/JPG). "
-            "Most common cause: the base64 string is truncated when copying/pasting."
+    if _txt2img_pipe is None:
+        kwargs = dict(
+            torch_dtype=torch.float16,
+            safety_checker=None,
+            requires_safety_checker=False,
         )
+        if HF_TOKEN:
+            kwargs["token"] = HF_TOKEN
 
+        _txt2img_pipe = StableDiffusionPipeline.from_pretrained(MODEL_ID, **kwargs).to("cuda")
+        _txt2img_pipe.enable_attention_slicing()
 
-def _resolve_imbb_to_direct(url: str) -> str:
-    if "ibb.co/" not in url or "i.ibb.co/" in url:
-        return url
+        # Create img2img pipe reusing components (faster + less memory)
+        _img2img_pipe = StableDiffusionImg2ImgPipeline(**_txt2img_pipe.components).to("cuda")
+        _img2img_pipe.enable_attention_slicing()
 
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
-
-    html = r.text
-    for key in ['property="og:image"', "property='og:image'"]:
-        idx = html.find(key)
-        if idx != -1:
-            part = html[idx: idx + 500]
-            for q in ['content="', "content='"]:
-                j = part.find(q)
-                if j != -1:
-                    part2 = part[j + len(q):]
-                    end = part2.find('"') if q.endswith('"') else part2.find("'")
-                    if end != -1:
-                        direct = part2[:end].strip()
-                        if direct.startswith("http"):
-                            return direct
-
-    return url
+    return _txt2img_pipe, _img2img_pipe
 
 
 def _download_image(url: str) -> Image.Image:
-    url = url.strip()
-    url = _resolve_imbb_to_direct(url)
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
 
-    with requests.get(url, stream=True, timeout=30, allow_redirects=True) as r:
-        r.raise_for_status()
-        content = BytesIO()
-        total = 0
-        for chunk in r.iter_content(chunk_size=1024 * 128):
-            if not chunk:
-                continue
-            total += len(chunk)
-            if total > MAX_IMAGE_BYTES:
-                raise ValueError(
-                    f"Downloaded image is too large (> {MAX_IMAGE_BYTES} bytes). "
-                    "Use a smaller image or increase MAX_IMAGE_BYTES."
-                )
-            content.write(chunk)
-
-    content.seek(0)
-    try:
-        img = Image.open(content)
-        img.load()
-        return img.convert("RGB")
-    except UnidentifiedImageError:
+    # If user accidentally provides a page URL (HTML), fail with a clear message
+    content_type = (r.headers.get("content-type") or "").lower()
+    if "text/html" in content_type:
         raise ValueError(
-            "init_image_url did not point to a valid image file (PNG/JPG). "
-            "If you use imgbb, use the direct image link (starts with https://i.ibb.co/...) "
-            "or paste the imgbb page link and let the worker resolve it."
+            "init_image_url returned HTML, not an image. "
+            "Use a direct image URL like https://i.ibb.co/.../file.jpg"
         )
 
+    img = Image.open(BytesIO(r.content)).convert("RGB")
+    return img
 
-def _pick_size(input_data: Dict[str, Any]) -> Tuple[int, int]:
-    w = int(input_data.get("width", 512))
-    h = int(input_data.get("height", 512))
-    w = max(64, (w // 8) * 8)
-    h = max(64, (h // 8) * 8)
-    return w, h
+
+def _decode_base64_image(b64: str) -> Image.Image:
+    # Support data URLs: data:image/jpeg;base64,....
+    if b64.startswith("data:"):
+        b64 = b64.split(",", 1)[1]
+
+    raw = base64.b64decode(b64)
+    img = Image.open(BytesIO(raw)).convert("RGB")
+    return img
+
+
+def _image_to_base64_png(img: Image.Image) -> str:
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
 def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     try:
         input_data = event.get("input", {}) or {}
-        mode = (input_data.get("mode") or "txt2img").lower()
-        prompt = input_data.get("prompt") or ""
 
-        negative_prompt = input_data.get("negative_prompt") or ""
-        steps = int(input_data.get("steps", 20))
-        guidance = float(input_data.get("guidance", 7.5))
+        mode = (input_data.get("mode") or "txt2img").strip().lower()
+        prompt = (input_data.get("prompt") or "").strip()
+        negative_prompt = (input_data.get("negative_prompt") or "").strip()
+
+        steps = int(input_data.get("steps") or 20)
+        guidance = float(input_data.get("guidance") or 7.5)
+
+        width = int(input_data.get("width") or 512)
+        height = int(input_data.get("height") or 512)
+
+        strength = float(input_data.get("strength") or 0.6)  # img2img
 
         if not prompt:
             return {"ok": False, "stage": "validation", "error": "prompt is required"}
 
-        pipe_t2i, pipe_i2i = _load_pipelines()
+        txt2img, img2img = _get_pipes()
 
         if mode == "txt2img":
-            width, height = _pick_size(input_data)
-            result = pipe_t2i(
+            result = txt2img(
                 prompt=prompt,
-                negative_prompt=negative_prompt,
+                negative_prompt=negative_prompt or None,
                 num_inference_steps=steps,
                 guidance_scale=guidance,
                 width=width,
                 height=height,
             )
-            img = result.images[0]
-
-            buf = BytesIO()
-            img.save(buf, format="PNG")
-            image_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-
+            image = result.images[0]
             return {
                 "ok": True,
                 "mode": "txt2img",
-                "image_base64": image_b64,
+                "image_base64": _image_to_base64_png(image),
                 "meta": {
+                    "model": MODEL_ID,
                     "prompt": prompt,
                     "negative_prompt": negative_prompt,
                     "steps": steps,
                     "guidance": guidance,
                     "width": width,
                     "height": height,
-                    "note": "SD1.5 via diffusers",
                 },
             }
 
         if mode == "img2img":
-            strength = float(input_data.get("strength", 0.6))
+            init_image: Optional[Image.Image] = None
 
-            init_img: Optional[Image.Image] = None
-            if input_data.get("init_image_base64"):
-                init_img = _image_from_base64(input_data["init_image_base64"])
-            elif input_data.get("init_image_url"):
-                init_img = _download_image(input_data["init_image_url"])
+            init_image_url = (input_data.get("init_image_url") or "").strip()
+            init_image_base64 = (input_data.get("init_image_base64") or "").strip()
+
+            if init_image_url:
+                init_image = _download_image(init_image_url)
+            elif init_image_base64:
+                init_image = _decode_base64_image(init_image_base64)
             else:
-                return {"ok": False, "stage": "validation", "error": "img2img requires init_image_base64 or init_image_url"}
+                return {
+                    "ok": False,
+                    "stage": "validation",
+                    "error": "For img2img provide init_image_url (recommended) or init_image_base64",
+                }
 
-            result = pipe_i2i(
+            # SD1.5 expects 512-ish. We resize safely.
+            init_image = init_image.resize((width, height))
+
+            result = img2img(
                 prompt=prompt,
-                negative_prompt=negative_prompt,
-                image=init_img,
+                negative_prompt=negative_prompt or None,
+                image=init_image,
                 strength=strength,
                 num_inference_steps=steps,
                 guidance_scale=guidance,
             )
-            img = result.images[0]
-
-            buf = BytesIO()
-            img.save(buf, format="PNG")
-            image_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-
+            image = result.images[0]
             return {
                 "ok": True,
                 "mode": "img2img",
-                "image_base64": image_b64,
+                "image_base64": _image_to_base64_png(image),
                 "meta": {
+                    "model": MODEL_ID,
                     "prompt": prompt,
                     "negative_prompt": negative_prompt,
                     "strength": strength,
                     "steps": steps,
                     "guidance": guidance,
-                    "note": "SD1.5 img2img via diffusers",
+                    "width": width,
+                    "height": height,
+                    "init_image_url_used": bool(init_image_url),
                 },
             }
 
