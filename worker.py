@@ -1,10 +1,14 @@
 import os
 import re
+import time
 import base64
 from io import BytesIO
 from typing import Any, Dict, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 from PIL import Image
 import runpod
 
@@ -29,6 +33,41 @@ MODEL_ID = os.getenv("MODEL_ID", "runwayml/stable-diffusion-v1-5")
 # Globals for warm reuse (container reuse between requests)
 _txt2img_pipe: Optional[StableDiffusionPipeline] = None
 _img2img_pipe: Optional[StableDiffusionImg2ImgPipeline] = None
+
+
+# ----------------------------
+# HTTP session with retries (important for 503/502/504 from image hosts)
+# ----------------------------
+def _make_http_session() -> requests.Session:
+    s = requests.Session()
+
+    retry = Retry(
+        total=6,
+        connect=6,
+        read=6,
+        status=6,
+        backoff_factor=1.2,  # exponential-ish backoff: 0s, 1.2s, 2.4s, 4.8s...
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET", "HEAD"),
+        raise_on_status=False,
+        respect_retry_after_header=True,
+    )
+
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+
+    # “Browser-like” headers reduce CDN anti-bot false positives.
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (RunPodWorker/1.0; +https://runpod.io)",
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+    })
+    return s
+
+
+_http = _make_http_session()
 
 
 def _require_cuda() -> None:
@@ -85,16 +124,61 @@ def _extract_direct_ibb_url(html: str) -> Optional[str]:
 
 
 def _download_image_as_pil(url: str) -> Image.Image:
-    # If user passes ibb.co page, try to resolve to i.ibb.co direct image
+    """
+    Robust downloader for init image.
+    Handles:
+      - ibb.co page links -> resolves to i.ibb.co direct
+      - transient CDN errors (429/5xx) with retries
+      - validates response is an image
+    """
+    # 1) If user passes ibb.co page, resolve to i.ibb.co direct image
     if "ibb.co/" in url and "i.ibb.co/" not in url:
-        r = requests.get(url, timeout=30)
-        r.raise_for_status()
+        r = _http.get(url, timeout=30)
+        if r.status_code >= 400:
+            raise RuntimeError(f"Failed to open ibb.co page: HTTP {r.status_code}")
         direct = _extract_direct_ibb_url(r.text)
         if direct:
             url = direct
 
-    r = requests.get(url, timeout=60)
-    r.raise_for_status()
+    # 2) Download with retries (handled by session adapter)
+    r = _http.get(url, timeout=60)
+
+    # If still 503 after retries, give actionable error.
+    if r.status_code == 503:
+        raise RuntimeError(
+            f"503 Server Error: Service Temporarily Unavailable for url: {url}. "
+            "This is usually a temporary CDN issue or rate-limit from the image host. "
+            "Try: (1) re-try same request later, (2) use a different direct i.ibb.co link, "
+            "(3) pass init_image_base64 instead of URL, or (4) host the image on another CDN."
+        )
+
+    if r.status_code >= 400:
+        raise RuntimeError(f"Image download failed: HTTP {r.status_code} for url: {url}")
+
+    content_type = (r.headers.get("Content-Type") or "").lower()
+
+    # Sometimes CDNs return HTML (error page) with 200 OK
+    if "image" not in content_type:
+        # If it looks like HTML and contains a direct link, attempt resolve again
+        text = ""
+        try:
+            text = r.text[:200_000]
+        except Exception:
+            text = ""
+        direct = _extract_direct_ibb_url(text) if text else None
+        if direct and direct != url:
+            r2 = _http.get(direct, timeout=60)
+            if r2.status_code >= 400:
+                raise RuntimeError(f"Resolved direct URL failed: HTTP {r2.status_code} for url: {direct}")
+            ct2 = (r2.headers.get("Content-Type") or "").lower()
+            if "image" not in ct2:
+                raise RuntimeError(f"Resolved URL did not return an image. Content-Type={ct2}")
+            img = Image.open(BytesIO(r2.content))
+            img.load()
+            return img.convert("RGB")
+
+        raise RuntimeError(f"URL did not return an image. Content-Type={content_type}")
+
     img = Image.open(BytesIO(r.content))
     img.load()
     return img.convert("RGB")
@@ -145,9 +229,9 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
 
             init_img: Optional[Image.Image] = None
             if input_data.get("init_image_url"):
-                init_img = _download_image_as_pil(input_data["init_image_url"])
+                init_img = _download_image_as_pil(str(input_data["init_image_url"]))
             elif input_data.get("init_image_base64"):
-                init_img = _decode_base64_to_pil(input_data["init_image_base64"])
+                init_img = _decode_base64_to_pil(str(input_data["init_image_base64"]))
 
             if init_img is None:
                 raise ValueError("img2img requires init_image_url or init_image_base64")
